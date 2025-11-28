@@ -7,6 +7,7 @@
 from fastapi import FastAPI
 import math
 import uvicorn
+import json
 
 try:
     from mangum import Mangum
@@ -19,6 +20,7 @@ print("[DEBUG] USE_LAMBDA=", USE_LAMBDA)
 
 app = FastAPI()
 
+#lat lon weight
 danger_hotspots = [
     (1.306947, 103.833945, 0.8),
     (1.319891, 103.890061, 0.6),
@@ -42,6 +44,70 @@ def danger_score(lat, lon, hotspot):
         d = math.sqrt((lat - h_lat)**2 + (lon - h_lon)**2)
         score += intensity * math.exp(-d / DECAY)
     return min(score, 1.0)
+
+
+def lambda_handler(event, context):
+    for record in event["Records"]:
+        
+        payload = json.loads(record["body"])
+        
+        print("Received payload:", payload)
+
+        # Step 3: Example — extract threat score
+        threat = payload["threatScore"]
+        print("Threat score:", threat)
+
+        # Step 4: Example — extract the first batch item
+        first_batch = payload["batchData"][0]
+        print("First batch datapoint:", first_batch)
+
+    return {}
+
+
+
+@app.post("/process_danger")
+def process_danger(payload: dict):
+
+    lat = payload.get("location", {}).get("latitude")
+    lon = payload.get("location", {}).get("longitude")
+
+    threat = payload.get("threatScore", 0)
+    danger = danger_score(lat, lon, danger_hotspots)
+    fake   = danger_score(lat, lon, fake_news_hotspot)
+
+    base_score = 0.7 * threat + 0.3 * danger
+
+    FAKE_WEIGHT = 0.3  # dont want to overdo the fake score part and give benefit of doubt
+    reliability = 1 - fake * FAKE_WEIGHT
+    reliability = max(0.0, min(1.0, reliability))
+
+    final_score = base_score * reliability
+    final_score = max(0.0, min(1.0, final_score))
+
+    fin_level = "null"
+    if final_score >= 0.7:
+        fin_level = "high"
+    elif final_score >= 0.5:
+        fin_level = "medium"
+    else:
+        fin_level = "low"
+
+    call_for_help = None
+    if fin_level == "high":
+        call_for_help = True
+    else:
+        call_for_help = False
+
+    return {
+        "recievedThreatScore": threat,
+        "geoDangerScore": danger,
+        "fakeNewsScore": fake,
+        "finalThreatScore": final_score,
+        "dangerLevel": fin_level,
+        "callAuthority": call_for_help
+    }
+
+
 
 @app.get("/danger")
 def get_danger(lat: float, lon: float):
