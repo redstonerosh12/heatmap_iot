@@ -8,6 +8,7 @@ from fastapi import FastAPI
 import math
 import uvicorn
 import json
+import time
 
 try:
     from mangum import Mangum
@@ -35,6 +36,11 @@ fake_news_hotspot = [
 
 ]
 
+typical_route = [
+    (1.336260, 103.887638),
+    (1.338771, 103.705947)
+]
+
 
 DECAY = 0.05  # tweak for steepness
 
@@ -44,6 +50,54 @@ def danger_score(lat, lon, hotspot):
         d = math.sqrt((lat - h_lat)**2 + (lon - h_lon)**2)
         score += intensity * math.exp(-d / DECAY)
     return min(score, 1.0)
+
+def emotion_score(emotion_payload):
+    emo = emotion_payload.get("emotion", "").lower()
+    conf = emotion_payload.get("confidence", 0.0)
+
+    danger_emotions = {"angry", "fear", "panic", "upset", "distress"}
+
+    if emo in danger_emotions:
+        return conf
+    return 0.0
+
+def time_danger_score() -> float:
+    """
+    hour: 0–23 (24h format)
+    Returns a value 0.0 (day) to 1.0 (max night danger)
+    """
+    hour = time.localtime().tm_hour
+
+    # Daytime: totally safe
+    if 6 <= hour < 18:
+        return 0.0
+
+    # Early evening: ramp up 18 → 22
+    if 18 <= hour < 22:
+        return (hour - 18) / 4  # 0 → 1 linearly
+
+    # Late night: fully dangerous
+    if 22 <= hour or hour < 6:
+        return 1.0
+    
+    else:
+        return 0.0
+    
+
+def anomalous_path_score(lat, lon, route_points):
+    """Returns score (0 to 1) based on deviation from nearest typical route"""
+    if lat is None or lon is None:
+        return 0.0
+
+    min_dist = float("inf")
+
+    for p_lat, p_lon in route_points:
+        d = math.sqrt((lat - p_lat)**2 + (lon - p_lon)**2)
+        min_dist = min(min_dist, d)
+
+    score = min(1.0, min_dist / 0.02)
+
+    return score
 
 
 def lambda_handler(event, context):
@@ -66,7 +120,9 @@ def lambda_handler(event, context):
 
 
 @app.post("/process_danger")
-def process_danger(payload: dict):
+def process_danger(req:dict):
+    payload = req.get("mqtt")
+    payload2 = req.get("sentiment")
 
     lat = payload.get("location", {}).get("latitude")
     lon = payload.get("location", {}).get("longitude")
@@ -74,10 +130,17 @@ def process_danger(payload: dict):
     threat = payload.get("threatScore", 0)
     danger = danger_score(lat, lon, danger_hotspots)
     fake   = danger_score(lat, lon, fake_news_hotspot)
+    time_score = time_danger_score()
+    emotion_danger = emotion_score(payload2)
+    anomaly_danger = anomalous_path_score(lat, lon, typical_route)
 
-    base_score = 0.7 * threat + 0.3 * danger
+    base_score = (
+        0.4 * emotion_danger + 
+        0.3 * danger +
+        0.1 * time_score +
+        0.1 * anomaly_danger)
 
-    FAKE_WEIGHT = 0.3  # dont want to overdo the fake score part and give benefit of doubt
+    FAKE_WEIGHT = 0.25  # dont want to overdo the fake score part and give benefit of doubt
     reliability = 1 - fake * FAKE_WEIGHT
     reliability = max(0.0, min(1.0, reliability))
 
@@ -104,7 +167,13 @@ def process_danger(payload: dict):
         "fakeNewsScore": fake,
         "finalThreatScore": final_score,
         "dangerLevel": fin_level,
-        "callAuthority": call_for_help
+        "callAuthority": call_for_help,
+        # "debug":{
+        #     "emotion_danger":emotion_danger,
+        #     "danger":danger,
+        #     "time_score":time_score,
+        #     "anomaly_danger":anomaly_danger
+        # }
     }
 
 
